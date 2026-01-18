@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    #build: .
+    image: ghcr.io/driftywinds/msgsched
+    container_name: msgsched
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist the database
+      - ./data:/data
+    environment:
+      - DB_PATH=/data/schedules.db
+    # Optional: limit resources
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
