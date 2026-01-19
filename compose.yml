@@ -6,16 +6,12 @@ services:
     image: ghcr.io/driftywinds/msgsched
     container_name: msgsched
     restart: unless-stopped
-    volumes:
-      - ./data:/data
     #environment:
-    #  - TZ=Asia/Kolkata
+    #  - DISCORD_TOKEN=${DISCORD_TOKEN}
+    #  - ADMIN_IDS=${ADMIN_IDS}
+    #  - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./data:/root/data
+      - ./schedules.db:/root/schedules.db
     env_file:
       - .env
-    working_dir: /app
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "msgsched"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s

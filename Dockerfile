@@ -1,40 +1,35 @@
-# Build stage - Use Debian for better C compatibility
-FROM golang:1.21-bookworm AS builder
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+# Install build dependencies for SQLite
+RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 WORKDIR /app
 
-# Copy go mod files first for better caching
+# Copy go mod files
 COPY go.mod go.sum ./
+
+# Download dependencies
 RUN go mod download
 
 # Copy source code
-COPY . .
+COPY *.go ./
 
-# Build the application (CGO enabled for SQLite)
-RUN CGO_ENABLED=1 GOOS=linux go build -o discord-bot main.go
+# Build with proper SQLite flags for Alpine
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o bot .
 
-# Final stage - Use Debian slim for compatibility
-FROM debian:12-slim
+# Runtime stage
+FROM alpine:latest
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    tzdata \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk --no-cache add ca-certificates sqlite-libs
 
-# Create non-root user
-RUN adduser --disabled-password --gecos "" --uid 1000 discordbot
+WORKDIR /root/
 
-WORKDIR /app
+# Copy the binary from builder
+COPY --from=builder /app/bot .
 
-# Copy binary from builder
-COPY --from=builder --chown=discordbot:discordbot /app/discord-bot .
+# Create directory for database
+RUN mkdir -p /root/data
 
-# Create data directory for persistent storage
-RUN mkdir -p /data && chown discordbot:discordbot /data
-
-# Switch to non-root user
-USER discordbot
-
-# Command to run the bot
-CMD ["./discord-bot"]
+# Run the bot
+CMD ["./bot"]
