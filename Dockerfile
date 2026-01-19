@@ -1,39 +1,49 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
-# Install build dependencies for SQLite
-RUN apk add --no-cache gcc musl-dev sqlite-dev
+# Install build dependencies
+RUN apk add --no-cache gcc musl-dev
 
+# Set working directory
 WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
 # Copy source code
-COPY main.go ./
+COPY . .
 
 # Build the application
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o scheduler-bot .
+RUN go build -o discord-bot main.go
 
 # Final stage
 FROM alpine:latest
 
-# Install runtime dependencies
-RUN apk --no-cache add ca-certificates sqlite-libs
+# Install runtime dependencies (sqlite3 needs libc)
+RUN apk add --no-cache ca-certificates sqlite-libs
 
-WORKDIR /root/
+# Create non-root user
+RUN adduser -D -u 1000 discordbot
 
-# Copy the binary from builder
-COPY --from=builder /app/scheduler-bot .
+# Set working directory
+WORKDIR /app
 
-# Create directory for database
-RUN mkdir -p /data
+# Copy binary from builder
+COPY --from=builder /app/discord-bot .
+COPY --from=builder /app/.env.example ./.env
 
-# Set environment variable for database location
-ENV DB_PATH=/data/schedules.db
+# Copy SQLite database if exists (for initial setup)
+COPY --from=builder /app/schedules.db ./schedules.db 2>/dev/null || :
 
-# Run the bot
-CMD ["./scheduler-bot"]
+# Create data directory for persistent storage
+RUN mkdir -p /data && chown discordbot:discordbot /data
+
+# Switch to non-root user
+USER discordbot
+
+# Expose volume for persistent data
+VOLUME /data
+
+# Command to run the bot
+CMD ["./discord-bot"]
