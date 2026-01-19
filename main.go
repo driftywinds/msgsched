@@ -14,9 +14,17 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/robfig/cron/v3"
 )
 
-var db *sql.DB
+var (
+	db          *sql.DB
+	cronManager *cron.Cron
+	admins      []string
+	debug       bool
+	botSession  *discordgo.Session
+	cronJobs    = make(map[int]cron.EntryID)
+)
 
 type Schedule struct {
 	ID          int
@@ -24,55 +32,62 @@ type Schedule struct {
 	Title       string
 	Message     string
 	ChannelID   string
-	IsRepeating bool
 	RepeatType  string
 	RepeatValue string
-	NextRun     time.Time
-	CreatedAt   time.Time
-}
-
-type User struct {
-	UserID   string
-	Timezone string
+	Active      bool
+	Timezone    string
 }
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found")
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
 	}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
-		log.Fatal("DISCORD_TOKEN not set in environment")
+		log.Fatal("DISCORD_TOKEN not set in .env")
 	}
 
-	var err error
-	db, err = initDB()
-	if err != nil {
-		log.Fatal("Failed to initialize database:", err)
+	adminIDs := os.Getenv("ADMIN_IDS")
+	if adminIDs == "" {
+		log.Fatal("ADMIN_IDS not set in .env")
 	}
+	admins = strings.Split(adminIDs, ",")
+	for i := range admins {
+		admins[i] = strings.TrimSpace(admins[i])
+	}
+
+	debug = os.Getenv("DEBUG") == "true"
+
+	initDB()
 	defer db.Close()
+
+	cronManager = cron.New()
+	cronManager.Start()
+	defer cronManager.Stop()
 
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
 		log.Fatal("Error creating Discord session:", err)
 	}
 
+	botSession = dg
+
 	dg.AddHandler(ready)
 	dg.AddHandler(interactionCreate)
 
 	dg.Identify.Intents = discordgo.IntentsGuilds
 
-	if err := dg.Open(); err != nil {
+	err = dg.Open()
+	if err != nil {
 		log.Fatal("Error opening connection:", err)
 	}
 
-	log.Println("Registering commands...")
 	registerCommands(dg)
+	loadSchedules()
 
-	go scheduleRunner(dg)
-
-	log.Println("Bot is running. Press CTRL+C to exit.")
+	fmt.Println("Bot is now running. Press CTRL-C to exit.")
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
@@ -80,56 +95,61 @@ func main() {
 	dg.Close()
 }
 
-func initDB() (*sql.DB, error) {
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "./schedules.db"
-	}
-	
-	db, err := sql.Open("sqlite3", dbPath)
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", "./schedules.db")
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
 	}
 
-	createSchedulesTable := `
+	createTables := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		timezone TEXT DEFAULT 'Asia/Kolkata'
+	);
+
 	CREATE TABLE IF NOT EXISTS schedules (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id TEXT NOT NULL,
 		title TEXT NOT NULL,
 		message TEXT NOT NULL,
 		channel_id TEXT NOT NULL,
-		is_repeating BOOLEAN NOT NULL,
-		repeat_type TEXT,
+		repeat_type TEXT NOT NULL,
 		repeat_value TEXT,
-		next_run DATETIME NOT NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		active BOOLEAN DEFAULT 1,
+		timezone TEXT DEFAULT 'Asia/Kolkata'
 	);`
 
-	createUsersTable := `
-	CREATE TABLE IF NOT EXISTS users (
-		user_id TEXT PRIMARY KEY,
-		timezone TEXT DEFAULT 'UTC'
-	);`
-
-	if _, err = db.Exec(createSchedulesTable); err != nil {
-		return nil, err
-	}
-	if _, err = db.Exec(createUsersTable); err != nil {
-		return nil, err
+	_, err = db.Exec(createTables)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	return db, nil
+	debugLog("Database initialized")
 }
 
 func ready(s *discordgo.Session, event *discordgo.Ready) {
-	log.Printf("Logged in as: %v#%v", s.State.User.Username, s.State.User.Discriminator)
+	s.UpdateGameStatus(0, "Scheduling messages")
+	debugLog(fmt.Sprintf("Logged in as: %v#%v", s.State.User.Username, s.State.User.Discriminator))
 }
 
 func registerCommands(s *discordgo.Session) {
 	commands := []*discordgo.ApplicationCommand{
 		{
 			Name:        "help",
-			Description: "Show help information about the scheduler bot",
+			Description: "Show all available commands",
+		},
+		{
+			Name:        "set_timezone",
+			Description: "Set your timezone (e.g., Asia/Kolkata)",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "timezone",
+					Description: "Timezone in IANA format",
+					Required:    true,
+				},
+			},
 		},
 		{
 			Name:        "create_schedule",
@@ -137,47 +157,95 @@ func registerCommands(s *discordgo.Session) {
 		},
 		{
 			Name:        "list_schedules",
-			Description: "List all your schedules",
+			Description: "List your schedules",
 		},
 		{
-			Name:        "delete_schedule",
-			Description: "Delete a schedule by ID",
+			Name:        "edit_schedule",
+			Description: "Edit an existing schedule",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionInteger,
 					Name:        "id",
-					Description: "Schedule ID to delete",
+					Description: "Schedule ID",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "pause_schedule",
+			Description: "Pause a schedule",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "id",
+					Description: "Schedule ID",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "resume_schedule",
+			Description: "Resume a paused schedule",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "id",
+					Description: "Schedule ID",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "delete_schedule",
+			Description: "Delete a schedule",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "id",
+					Description: "Schedule ID",
 					Required:    true,
 				},
 			},
 		},
 		{
 			Name:        "test_schedule",
-			Description: "Test a schedule by sending it immediately",
+			Description: "Send a test message immediately",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionInteger,
 					Name:        "id",
-					Description: "Schedule ID to test",
+					Description: "Schedule ID",
 					Required:    true,
 				},
 			},
 		},
 		{
-			Name:        "set_timezone",
-			Description: "Set your timezone for schedule times",
+			Name:        "admin_list_all",
+			Description: "[Admin] List all schedules",
+		},
+		{
+			Name:        "admin_pause",
+			Description: "[Admin] Pause any schedule",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
-					Type:        discordgo.ApplicationCommandOptionString,
-					Name:        "timezone",
-					Description: "Timezone (e.g., America/New_York, Europe/London, Asia/Kolkata)",
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "id",
+					Description: "Schedule ID",
 					Required:    true,
 				},
 			},
 		},
 		{
-			Name:        "get_timezone",
-			Description: "Check your current timezone setting",
+			Name:        "admin_delete",
+			Description: "[Admin] Delete any schedule",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "id",
+					Description: "Schedule ID",
+					Required:    true,
+				},
+			},
 		},
 	}
 
@@ -187,59 +255,145 @@ func registerCommands(s *discordgo.Session) {
 			log.Printf("Cannot create '%v' command: %v", cmd.Name, err)
 		}
 	}
+
+	debugLog("Commands registered")
 }
 
 func interactionCreate(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if i.Type == discordgo.InteractionApplicationCommand {
-		switch i.ApplicationCommandData().Name {
-		case "help":
-			handleHelp(s, i)
-		case "create_schedule":
-			handleCreateSchedule(s, i)
-		case "list_schedules":
-			handleListSchedules(s, i)
-		case "delete_schedule":
-			handleDeleteSchedule(s, i)
-		case "test_schedule":
-			handleTestSchedule(s, i)
-		case "set_timezone":
-			handleSetTimezone(s, i)
-		case "get_timezone":
-			handleGetTimezone(s, i)
-		}
-	} else if i.Type == discordgo.InteractionModalSubmit {
+	switch i.Type {
+	case discordgo.InteractionApplicationCommand:
+		handleCommand(s, i)
+	case discordgo.InteractionModalSubmit:
 		handleModalSubmit(s, i)
 	}
 }
 
+func handleCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	debugLog(fmt.Sprintf("Command '%s' used by %s", i.ApplicationCommandData().Name, i.Member.User.ID))
+
+	switch i.ApplicationCommandData().Name {
+	case "help":
+		handleHelp(s, i)
+	case "set_timezone":
+		handleSetTimezone(s, i)
+	case "create_schedule":
+		handleCreateSchedule(s, i)
+	case "list_schedules":
+		handleListSchedules(s, i)
+	case "edit_schedule":
+		handleEditSchedule(s, i)
+	case "pause_schedule":
+		handlePauseSchedule(s, i)
+	case "resume_schedule":
+		handleResumeSchedule(s, i)
+	case "delete_schedule":
+		handleDeleteSchedule(s, i)
+	case "test_schedule":
+		handleTestSchedule(s, i)
+	case "admin_list_all":
+		handleAdminListAll(s, i)
+	case "admin_pause":
+		handleAdminPause(s, i)
+	case "admin_delete":
+		handleAdminDelete(s, i)
+	}
+}
+
+func handleModalSubmit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	data := i.ModalSubmitData()
+
+	if data.CustomID == "create_schedule_modal" {
+		handleCreateScheduleModal(s, i, data)
+	} else if strings.HasPrefix(data.CustomID, "edit_schedule_modal_") {
+		handleEditScheduleModal(s, i, data)
+	}
+}
+
+func handleCreateScheduleModal(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ModalSubmitInteractionData) {
+	title := data.Components[0].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	message := data.Components[1].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	channelID := data.Components[2].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	repeatType := strings.ToLower(data.Components[3].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value)
+	repeatValue := data.Components[4].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+
+	if repeatType != "none" && repeatType != "interval" && repeatType != "weekly" {
+		respondEphemeral(s, i, "Invalid repeat type. Use: none, interval, or weekly")
+		return
+	}
+
+	timezone := getUserTimezone(i.Member.User.ID)
+
+	result, err := db.Exec("INSERT INTO schedules (user_id, title, message, channel_id, repeat_type, repeat_value, timezone) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		i.Member.User.ID, title, message, channelID, repeatType, repeatValue, timezone)
+	if err != nil {
+		respondEphemeral(s, i, "Error creating schedule: "+err.Error())
+		return
+	}
+
+	scheduleID, _ := result.LastInsertId()
+
+	scheduleJob(int(scheduleID), channelID, message, repeatType, repeatValue, timezone)
+
+	debugLog(fmt.Sprintf("User %s created schedule %d: %s", i.Member.User.ID, scheduleID, title))
+	respondEphemeral(s, i, fmt.Sprintf("✅ Schedule created! ID: %d\nTitle: %s\nType: %s", scheduleID, title, repeatType))
+}
+
+func handleEditScheduleModal(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ModalSubmitInteractionData) {
+	scheduleIDStr := strings.TrimPrefix(data.CustomID, "edit_schedule_modal_")
+	scheduleID, _ := strconv.Atoi(scheduleIDStr)
+
+	title := data.Components[0].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	message := data.Components[1].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	channelID := data.Components[2].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+	repeatType := strings.ToLower(data.Components[3].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value)
+	repeatValue := data.Components[4].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
+
+	if repeatType != "none" && repeatType != "interval" && repeatType != "weekly" {
+		respondEphemeral(s, i, "Invalid repeat type. Use: none, interval, or weekly")
+		return
+	}
+
+	timezone := getUserTimezone(i.Member.User.ID)
+
+	_, err := db.Exec("UPDATE schedules SET title = ?, message = ?, channel_id = ?, repeat_type = ?, repeat_value = ?, timezone = ? WHERE id = ? AND user_id = ?",
+		title, message, channelID, repeatType, repeatValue, timezone, scheduleID, i.Member.User.ID)
+	if err != nil {
+		respondEphemeral(s, i, "Error updating schedule")
+		return
+	}
+
+	removeScheduleJob(scheduleID)
+	scheduleJob(scheduleID, channelID, message, repeatType, repeatValue, timezone)
+
+	debugLog(fmt.Sprintf("User %s edited schedule %d", i.Member.User.ID, scheduleID))
+	respondEphemeral(s, i, fmt.Sprintf("✅ Schedule %d updated!", scheduleID))
+}
+
 func handleHelp(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	helpText := "**📅 Schedule Bot Help**\n\n" +
-		"**Commands:**\n" +
-		"• `/create_schedule` - Create a new message schedule\n" +
-		"• `/list_schedules` - View all your schedules\n" +
-		"• `/delete_schedule` - Delete a schedule by ID\n" +
-		"• `/test_schedule` - Test a schedule by sending it immediately\n" +
-		"• `/set_timezone` - Set your timezone for interpreting times\n" +
-		"• `/get_timezone` - Check your current timezone\n" +
-		"• `/help` - Show this help message\n\n" +
-		"**How it works:**\n" +
-		"1. Set your timezone with `/set_timezone`\n" +
-		"2. Use `/create_schedule` to start\n" +
-		"3. Fill in the modal with your schedule details\n" +
-		"4. Test it with `/test_schedule` if you want\n" +
-		"5. The bot will send your message at the scheduled time!\n\n" +
-		"**Repeat Options:**\n" +
-		"• **None** - Send once only\n" +
-		"• **Interval** - Repeat every X minutes (e.g., \"60\" for hourly)\n" +
-		"• **Days** - Repeat on specific days (e.g., \"Mon,Wed,Fri\")\n\n" +
-		"**Time Format:**\n" +
-		"Use format: `2006-01-02 15:04` (YYYY-MM-DD HH:MM in your timezone)\n" +
-		"Example: `2024-12-25 09:00`\n\n" +
-		"**Common Timezones:**\n" +
-		"• America/New_York, America/Los_Angeles\n" +
-		"• Europe/London, Europe/Paris\n" +
-		"• Asia/Kolkata, Asia/Tokyo\n" +
-		"• Australia/Sydney"
+	helpText := `**Message Scheduler Bot Commands**
+
+**User Commands:**
+/set_timezone - Set your timezone (e.g., Asia/Kolkata)
+/create_schedule - Create a new message schedule
+/list_schedules - List your schedules
+/edit_schedule - Edit an existing schedule
+/pause_schedule - Pause a schedule
+/resume_schedule - Resume a paused schedule
+/delete_schedule - Delete a schedule
+/test_schedule - Test a schedule by sending immediately
+
+**Admin Commands:**
+/admin_list_all - List all schedules from all users
+/admin_pause - Pause any user's schedule
+/admin_delete - Delete any user's schedule
+
+**Repeat Types:**
+**none** - Send once (leave repeat_value empty or specify time: 2024-12-25 10:00)
+**interval** - Repeat every X time (examples: 30m, 2h, 1h30m)
+**weekly** - Repeat on specific days (examples: Mon,Wed,Fri 09:00 or Tue,Thu 14:30)
+
+**Days:** Mon, Tue, Wed, Thu, Fri, Sat, Sun
+**Time format:** 24-hour (e.g., 09:00, 14:30, 23:45)`
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -254,75 +408,36 @@ func handleSetTimezone(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	options := i.ApplicationCommandData().Options
 	timezone := options[0].StringValue()
 
-	// Validate timezone
 	_, err := time.LoadLocation(timezone)
 	if err != nil {
-		respondError(s, i, "Invalid timezone. Use format like 'America/New_York' or 'Asia/Kolkata'")
+		respondEphemeral(s, i, "Invalid timezone format. Use IANA timezone format (e.g., Asia/Kolkata)")
 		return
 	}
 
-	_, err = db.Exec("INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)",
-		i.Member.User.ID, timezone)
+	_, err = db.Exec("INSERT OR REPLACE INTO users (id, timezone) VALUES (?, ?)", i.Member.User.ID, timezone)
 	if err != nil {
-		respondError(s, i, "Failed to set timezone")
+		respondEphemeral(s, i, "Error saving timezone")
 		return
 	}
 
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("✅ Timezone set to **%s**", timezone),
-			Flags:   discordgo.MessageFlagsEphemeral,
-		},
-	})
-}
-
-func handleGetTimezone(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	timezone := getUserTimezone(i.Member.User.ID)
-	currentTime := time.Now().In(getLocation(timezone))
-
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("🌍 Your timezone: **%s**\nCurrent time: **%s**",
-				timezone, currentTime.Format("2006-01-02 15:04:05")),
-			Flags: discordgo.MessageFlagsEphemeral,
-		},
-	})
-}
-
-func getUserTimezone(userID string) string {
-	var timezone string
-	err := db.QueryRow("SELECT timezone FROM users WHERE user_id = ?", userID).Scan(&timezone)
-	if err != nil {
-		return "UTC"
-	}
-	return timezone
-}
-
-func getLocation(timezone string) *time.Location {
-	loc, err := time.LoadLocation(timezone)
-	if err != nil {
-		loc, _ = time.LoadLocation("UTC")
-	}
-	return loc
+	debugLog(fmt.Sprintf("User %s set timezone to %s", i.Member.User.ID, timezone))
+	respondEphemeral(s, i, fmt.Sprintf("✅ Timezone set to %s", timezone))
 }
 
 func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	timezone := getUserTimezone(i.Member.User.ID)
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
-			CustomID: "schedule_modal",
+			CustomID: "create_schedule_modal",
 			Title:    "Create New Schedule",
 			Components: []discordgo.MessageComponent{
 				discordgo.ActionsRow{
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
 							CustomID:    "title",
-							Label:       "Title",
+							Label:       "Schedule Title",
 							Style:       discordgo.TextInputShort,
-							Placeholder: "My Schedule",
+							Placeholder: "My Daily Reminder",
 							Required:    true,
 							MaxLength:   100,
 						},
@@ -332,9 +447,9 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
 							CustomID:    "message",
-							Label:       "Message",
+							Label:       "Message to Send",
 							Style:       discordgo.TextInputParagraph,
-							Placeholder: "The message to send",
+							Placeholder: "Hello everyone!",
 							Required:    true,
 							MaxLength:   2000,
 						},
@@ -343,7 +458,7 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 				discordgo.ActionsRow{
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
-							CustomID:    "channel_id",
+							CustomID:    "channel",
 							Label:       "Channel ID",
 							Style:       discordgo.TextInputShort,
 							Placeholder: "Right-click channel > Copy ID",
@@ -354,10 +469,10 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 				discordgo.ActionsRow{
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
-							CustomID:    "first_run",
-							Label:       fmt.Sprintf("First Run (YYYY-MM-DD HH:MM in %s)", timezone),
+							CustomID:    "repeat_type",
+							Label:       "Repeat Type (none/interval/weekly)",
 							Style:       discordgo.TextInputShort,
-							Placeholder: "2024-12-25 09:00",
+							Placeholder: "none",
 							Required:    true,
 						},
 					},
@@ -365,11 +480,11 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 				discordgo.ActionsRow{
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
-							CustomID:    "repeat",
-							Label:       "Repeat: none/interval:60/days:Mon,Wed,Fri",
+							CustomID:    "repeat_value",
+							Label:       "Repeat Config (see /help)",
 							Style:       discordgo.TextInputShort,
-							Placeholder: "none",
-							Required:    true,
+							Placeholder: "60m OR Mon,Wed,Fri 09:00",
+							Required:    false,
 						},
 					},
 				},
@@ -382,83 +497,10 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 	}
 }
 
-func handleModalSubmit(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	data := i.ModalSubmitData()
-
-	title := data.Components[0].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
-	message := data.Components[1].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
-	channelID := data.Components[2].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
-	firstRunStr := data.Components[3].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
-	repeatStr := data.Components[4].(*discordgo.ActionsRow).Components[0].(*discordgo.TextInput).Value
-
-	// Get user's timezone
-	timezone := getUserTimezone(i.Member.User.ID)
-	loc := getLocation(timezone)
-
-	// Parse time in user's timezone
-	firstRun, err := time.ParseInLocation("2006-01-02 15:04", firstRunStr, loc)
-	if err != nil {
-		respondError(s, i, "Invalid time format. Use: YYYY-MM-DD HH:MM")
-		return
-	}
-
-	// Convert to UTC for storage
-	firstRunUTC := firstRun.UTC()
-
-	isRepeating := false
-	repeatType := "none"
-	repeatValue := ""
-
-	if repeatStr != "none" {
-		isRepeating = true
-		parts := strings.SplitN(repeatStr, ":", 2)
-		if len(parts) == 2 {
-			repeatType = parts[0]
-			repeatValue = parts[1]
-		} else {
-			respondError(s, i, "Invalid repeat format. Use: none, interval:60, or days:Mon,Wed,Fri")
-			return
-		}
-	}
-
-	_, err = db.Exec(`
-		INSERT INTO schedules (user_id, title, message, channel_id, is_repeating, repeat_type, repeat_value, next_run)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		i.Member.User.ID, title, message, channelID, isRepeating, repeatType, repeatValue, firstRunUTC)
-
-	if err != nil {
-		respondError(s, i, "Failed to create schedule: "+err.Error())
-		return
-	}
-
-	// Get username for logging
-	username := i.Member.User.Username
-	if i.Member.User.GlobalName != "" {
-		username = i.Member.User.GlobalName
-	}
-
-	log.Printf("📅 NEW SCHEDULE CREATED by %s (@%s):\n  Title: %s\n  Channel: %s\n  First Run: %s (%s)\n  Repeat: %s\n",
-		username, i.Member.User.Username, title, channelID, firstRun.Format("2006-01-02 15:04"), timezone, repeatStr)
-
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("✅ Schedule **%s** created successfully!\nFirst run: %s (%s)\nUse `/test_schedule` to test it!",
-				title, firstRun.Format("2006-01-02 15:04"), timezone),
-			Flags: discordgo.MessageFlagsEphemeral,
-		},
-	})
-}
-
 func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	timezone := getUserTimezone(i.Member.User.ID)
-	loc := getLocation(timezone)
-
-	rows, err := db.Query(`
-		SELECT id, title, message, channel_id, is_repeating, repeat_type, repeat_value, next_run
-		FROM schedules WHERE user_id = ? ORDER BY next_run`, i.Member.User.ID)
+	rows, err := db.Query("SELECT id, title, channel_id, repeat_type, active FROM schedules WHERE user_id = ?", i.Member.User.ID)
 	if err != nil {
-		respondError(s, i, "Failed to fetch schedules")
+		respondEphemeral(s, i, "Error fetching schedules")
 		return
 	}
 	defer rows.Close()
@@ -466,36 +508,274 @@ func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var schedules []string
 	for rows.Next() {
 		var id int
-		var title, message, channelID, repeatType, repeatValue string
-		var isRepeating bool
-		var nextRunUTC time.Time
+		var title, channelID, repeatType string
+		var active bool
+		rows.Scan(&id, &title, &channelID, &repeatType, &active)
 
-		rows.Scan(&id, &title, &message, &channelID, &isRepeating, &repeatType, &repeatValue, &nextRunUTC)
-
-		// Convert to user's timezone
-		nextRun := nextRunUTC.In(loc)
-
-		repeatInfo := "One-time"
-		if isRepeating {
-			if repeatType == "interval" {
-				repeatInfo = fmt.Sprintf("Every %s minutes", repeatValue)
-			} else if repeatType == "days" {
-				repeatInfo = fmt.Sprintf("Days: %s", repeatValue)
-			}
+		status := "✅ Active"
+		if !active {
+			status = "⏸️ Paused"
 		}
 
-		schedules = append(schedules, fmt.Sprintf(
-			"**ID: %d** | %s\nNext: %s | %s\nChannel: <#%s>",
-			id, title, nextRun.Format("2006-01-02 15:04"), repeatInfo, channelID))
+		schedules = append(schedules, fmt.Sprintf("**ID %d**: %s | %s | Type: %s | Channel: <#%s>", id, title, status, repeatType, channelID))
 	}
 
-	content := fmt.Sprintf("**📅 Your Schedules** (Timezone: %s)\n\n", timezone)
 	if len(schedules) == 0 {
-		content += "No schedules found. Use `/create_schedule` to create one!"
-	} else {
-		content += strings.Join(schedules, "\n\n")
+		respondEphemeral(s, i, "You have no schedules. Use /create_schedule to create one!")
+		return
 	}
 
+	respondEphemeral(s, i, "**Your Schedules:**\n"+strings.Join(schedules, "\n"))
+}
+
+func handlePauseSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	result, err := db.Exec("UPDATE schedules SET active = 0 WHERE id = ? AND user_id = ?", id, i.Member.User.ID)
+	if err != nil {
+		respondEphemeral(s, i, "Error pausing schedule")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		respondEphemeral(s, i, "Schedule not found or you don't have permission")
+		return
+	}
+
+	removeScheduleJob(id)
+
+	debugLog(fmt.Sprintf("User %s paused schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, fmt.Sprintf("⏸️ Schedule %d paused", id))
+}
+
+func handleResumeSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	var channelID, message, repeatType, repeatValue, timezone string
+	err := db.QueryRow("SELECT channel_id, message, repeat_type, repeat_value, timezone FROM schedules WHERE id = ? AND user_id = ?",
+		id, i.Member.User.ID).Scan(&channelID, &message, &repeatType, &repeatValue, &timezone)
+
+	if err != nil {
+		respondEphemeral(s, i, "Schedule not found or you don't have permission")
+		return
+	}
+
+	_, err = db.Exec("UPDATE schedules SET active = 1 WHERE id = ?", id)
+	if err != nil {
+		respondEphemeral(s, i, "Error resuming schedule")
+		return
+	}
+
+	scheduleJob(id, channelID, message, repeatType, repeatValue, timezone)
+
+	debugLog(fmt.Sprintf("User %s resumed schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, fmt.Sprintf("▶️ Schedule %d resumed", id))
+}
+
+func handleDeleteSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	result, err := db.Exec("DELETE FROM schedules WHERE id = ? AND user_id = ?", id, i.Member.User.ID)
+	if err != nil {
+		respondEphemeral(s, i, "Error deleting schedule")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		respondEphemeral(s, i, "Schedule not found or you don't have permission")
+		return
+	}
+
+	removeScheduleJob(id)
+
+	debugLog(fmt.Sprintf("User %s deleted schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, fmt.Sprintf("🗑️ Schedule %d deleted", id))
+}
+
+func handleTestSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	var message, channelID string
+	err := db.QueryRow("SELECT message, channel_id FROM schedules WHERE id = ? AND user_id = ?", id, i.Member.User.ID).Scan(&message, &channelID)
+	if err != nil {
+		respondEphemeral(s, i, "Schedule not found or you don't have permission")
+		return
+	}
+
+	_, err = s.ChannelMessageSend(channelID, message)
+	if err != nil {
+		respondEphemeral(s, i, "Error sending test message. Check channel permissions and ID.")
+		return
+	}
+
+	debugLog(fmt.Sprintf("User %s tested schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, "✅ Test message sent!")
+}
+
+func handleEditSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	var title, message, channelID, repeatType, repeatValue string
+	err := db.QueryRow("SELECT title, message, channel_id, repeat_type, repeat_value FROM schedules WHERE id = ? AND user_id = ?",
+		id, i.Member.User.ID).Scan(&title, &message, &channelID, &repeatType, &repeatValue)
+
+	if err != nil {
+		respondEphemeral(s, i, "Schedule not found or you don't have permission")
+		return
+	}
+
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseModal,
+		Data: &discordgo.InteractionResponseData{
+			CustomID: fmt.Sprintf("edit_schedule_modal_%d", id),
+			Title:    "Edit Schedule",
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "title",
+							Label:       "Schedule Title",
+							Style:       discordgo.TextInputShort,
+							Value:       title,
+							Required:    true,
+							MaxLength:   100,
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "message",
+							Label:       "Message to Send",
+							Style:       discordgo.TextInputParagraph,
+							Value:       message,
+							Required:    true,
+							MaxLength:   2000,
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "channel",
+							Label:       "Channel ID",
+							Style:       discordgo.TextInputShort,
+							Value:       channelID,
+							Required:    true,
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "repeat_type",
+							Label:       "Repeat Type",
+							Style:       discordgo.TextInputShort,
+							Value:       repeatType,
+							Required:    true,
+						},
+					},
+				},
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.TextInput{
+							CustomID:    "repeat_value",
+							Label:       "Repeat Config",
+							Style:       discordgo.TextInputShort,
+							Value:       repeatValue,
+							Required:    false,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	if err != nil {
+		log.Println("Error showing edit modal:", err)
+	}
+}
+
+func handleAdminListAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !isAdmin(i.Member.User.ID) {
+		respondEphemeral(s, i, "❌ You don't have permission to use this command")
+		return
+	}
+
+	rows, err := db.Query("SELECT id, user_id, title, channel_id, repeat_type, active FROM schedules")
+	if err != nil {
+		respondEphemeral(s, i, "Error fetching schedules")
+		return
+	}
+	defer rows.Close()
+
+	var schedules []string
+	for rows.Next() {
+		var id int
+		var userID, title, channelID, repeatType string
+		var active bool
+		rows.Scan(&id, &userID, &title, &channelID, &repeatType, &active)
+
+		status := "✅"
+		if !active {
+			status = "⏸️"
+		}
+
+		schedules = append(schedules, fmt.Sprintf("%s **ID %d**: %s | User: <@%s> | Type: %s", status, id, title, userID, repeatType))
+	}
+
+	if len(schedules) == 0 {
+		respondEphemeral(s, i, "No schedules found")
+		return
+	}
+
+	debugLog(fmt.Sprintf("Admin %s listed all schedules", i.Member.User.ID))
+	respondEphemeral(s, i, "**All Schedules:**\n"+strings.Join(schedules, "\n"))
+}
+
+func handleAdminPause(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !isAdmin(i.Member.User.ID) {
+		respondEphemeral(s, i, "❌ You don't have permission to use this command")
+		return
+	}
+
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	_, err := db.Exec("UPDATE schedules SET active = 0 WHERE id = ?", id)
+	if err != nil {
+		respondEphemeral(s, i, "Error pausing schedule")
+		return
+	}
+
+	removeScheduleJob(id)
+
+	debugLog(fmt.Sprintf("Admin %s paused schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, fmt.Sprintf("⏸️ Schedule %d paused", id))
+}
+
+func handleAdminDelete(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !isAdmin(i.Member.User.ID) {
+		respondEphemeral(s, i, "❌ You don't have permission to use this command")
+		return
+	}
+
+	id := int(i.ApplicationCommandData().Options[0].IntValue())
+
+	_, err := db.Exec("DELETE FROM schedules WHERE id = ?", id)
+	if err != nil {
+		respondEphemeral(s, i, "Error deleting schedule")
+		return
+	}
+
+	removeScheduleJob(id)
+
+	debugLog(fmt.Sprintf("Admin %s deleted schedule %d", i.Member.User.ID, id))
+	respondEphemeral(s, i, fmt.Sprintf("🗑️ Schedule %d deleted", id))
+}
+
+func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
@@ -505,132 +785,185 @@ func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	})
 }
 
-func handleDeleteSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	options := i.ApplicationCommandData().Options
-	scheduleID := options[0].IntValue()
-
-	result, err := db.Exec("DELETE FROM schedules WHERE id = ? AND user_id = ?", scheduleID, i.Member.User.ID)
+func getUserTimezone(userID string) string {
+	var timezone string
+	err := db.QueryRow("SELECT timezone FROM users WHERE id = ?", userID).Scan(&timezone)
 	if err != nil {
-		respondError(s, i, "Failed to delete schedule")
-		return
+		return "Asia/Kolkata"
 	}
-
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		respondError(s, i, "Schedule not found or you don't have permission to delete it")
-		return
-	}
-
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("✅ Schedule #%d deleted successfully!", scheduleID),
-			Flags:   discordgo.MessageFlagsEphemeral,
-		},
-	})
+	return timezone
 }
 
-func handleTestSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	options := i.ApplicationCommandData().Options
-	scheduleID := options[0].IntValue()
-
-	var title, message, channelID string
-	err := db.QueryRow("SELECT title, message, channel_id FROM schedules WHERE id = ? AND user_id = ?",
-		scheduleID, i.Member.User.ID).Scan(&title, &message, &channelID)
-
-	if err != nil {
-		respondError(s, i, "Schedule not found or you don't have permission to test it")
-		return
+func isAdmin(userID string) bool {
+	for _, admin := range admins {
+		if admin == userID {
+			return true
+		}
 	}
-
-	// Send test message
-	testMessage := fmt.Sprintf("**🧪 TEST MESSAGE for: %s**\n\n%s", title, message)
-	_, err = s.ChannelMessageSend(channelID, testMessage)
-	if err != nil {
-		respondError(s, i, "Failed to send test message. Check channel ID and bot permissions: "+err.Error())
-		return
-	}
-
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("✅ Test message sent for schedule **%s** in <#%s>!", title, channelID),
-			Flags:   discordgo.MessageFlagsEphemeral,
-		},
-	})
-
-	log.Printf("🧪 TEST SCHEDULE #%d (%s) sent by @%s", scheduleID, title, i.Member.User.Username)
+	return false
 }
 
-func respondError(s *discordgo.Session, i *discordgo.InteractionCreate, message string) {
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: "❌ " + message,
-			Flags:   discordgo.MessageFlagsEphemeral,
-		},
-	})
+func debugLog(message string) {
+	if debug {
+		log.Println("[DEBUG]", message)
+	}
 }
 
-func scheduleRunner(s *discordgo.Session) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+func loadSchedules() {
+	rows, err := db.Query("SELECT id, channel_id, message, repeat_type, repeat_value, timezone FROM schedules WHERE active = 1")
+	if err != nil {
+		log.Println("Error loading schedules:", err)
+		return
+	}
+	defer rows.Close()
 
-	for range ticker.C {
-		rows, err := db.Query("SELECT id, message, channel_id, is_repeating, repeat_type, repeat_value, next_run FROM schedules WHERE next_run <= ?", time.Now().UTC())
+	count := 0
+	for rows.Next() {
+		var id int
+		var channelID, message, repeatType, repeatValue, timezone string
+		rows.Scan(&id, &channelID, &message, &repeatType, &repeatValue, &timezone)
+
+		scheduleJob(id, channelID, message, repeatType, repeatValue, timezone)
+		count++
+	}
+
+	debugLog(fmt.Sprintf("Loaded %d active schedules", count))
+}
+
+func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone string) {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+
+	var cronSpec string
+
+	switch repeatType {
+	case "interval":
+		// Parse interval like "30m", "2h", "1h30m"
+		duration, err := time.ParseDuration(repeatValue)
 		if err != nil {
-			log.Println("Error querying schedules:", err)
-			continue
+			log.Printf("Invalid interval for schedule %d: %s", id, repeatValue)
+			return
 		}
 
-		for rows.Next() {
-			var id int
-			var message, channelID, repeatType, repeatValue string
-			var isRepeating bool
-			var nextRun time.Time
+		// Use cron's @every syntax
+		cronSpec = fmt.Sprintf("@every %s", duration.String())
 
-			rows.Scan(&id, &message, &channelID, &isRepeating, &repeatType, &repeatValue, &nextRun)
+	case "weekly":
+		// Parse weekly schedule like "Mon,Wed,Fri 09:00"
+		parts := strings.Split(repeatValue, " ")
+		if len(parts) != 2 {
+			log.Printf("Invalid weekly format for schedule %d: %s", id, repeatValue)
+			return
+		}
 
-			_, err := s.ChannelMessageSend(channelID, message)
-			if err != nil {
-				log.Printf("❌ Error sending message for schedule #%d: %v", id, err)
-			} else {
-				log.Printf("📤 Sent scheduled message for schedule #%d to channel %s", id, channelID)
-			}
+		days := strings.Split(parts[0], ",")
+		timeStr := parts[1]
 
-			if isRepeating {
-				newNextRun := calculateNextRun(nextRun, repeatType, repeatValue)
-				db.Exec("UPDATE schedules SET next_run = ? WHERE id = ?", newNextRun, id)
-				log.Printf("🔄 Schedule #%d rescheduled for %s", id, newNextRun.Format("2006-01-02 15:04:05"))
-			} else {
-				db.Exec("DELETE FROM schedules WHERE id = ?", id)
-				log.Printf("✅ One-time schedule #%d completed and removed", id)
+		timeParts := strings.Split(timeStr, ":")
+		if len(timeParts) != 2 {
+			log.Printf("Invalid time format for schedule %d: %s", id, timeStr)
+			return
+		}
+
+		hour := timeParts[0]
+		minute := timeParts[1]
+
+		// Convert day names to cron day numbers
+		dayNumbers := []string{}
+		dayMap := map[string]string{
+			"sun": "0", "mon": "1", "tue": "2", "wed": "3",
+			"thu": "4", "fri": "5", "sat": "6",
+		}
+
+		for _, day := range days {
+			dayLower := strings.ToLower(strings.TrimSpace(day))
+			if num, ok := dayMap[dayLower]; ok {
+				dayNumbers = append(dayNumbers, num)
 			}
 		}
-		rows.Close()
+
+		if len(dayNumbers) == 0 {
+			log.Printf("No valid days for schedule %d", id)
+			return
+		}
+
+		// Cron format: minute hour * * day
+		cronSpec = fmt.Sprintf("%s %s * * %s", minute, hour, strings.Join(dayNumbers, ","))
+
+	case "none":
+		// One-time schedule - execute once and then disable
+		if repeatValue == "" {
+			// Execute immediately
+			go sendScheduledMessage(id, channelID, message)
+			return
+		}
+
+		// Parse specific time
+		t, err := time.ParseInLocation("2006-01-02 15:04", repeatValue, loc)
+		if err != nil {
+			log.Printf("Invalid time format for schedule %d: %s", id, repeatValue)
+			return
+		}
+
+		// Schedule for specific time
+		duration := time.Until(t)
+		if duration < 0 {
+			log.Printf("Schedule %d time is in the past: %s", id, repeatValue)
+			return
+		}
+
+		time.AfterFunc(duration, func() {
+			sendScheduledMessage(id, channelID, message)
+			// Disable after sending
+			db.Exec("UPDATE schedules SET active = 0 WHERE id = ?", id)
+			debugLog(fmt.Sprintf("One-time schedule %d completed and disabled", id))
+		})
+
+		debugLog(fmt.Sprintf("Scheduled one-time message for schedule %d at %s", id, t.Format("2006-01-02 15:04")))
+		return
+
+	default:
+		log.Printf("Unknown repeat type for schedule %d: %s", id, repeatType)
+		return
+	}
+
+	// Add cron job
+	entryID, err := cronManager.AddFunc(cronSpec, func() {
+		sendScheduledMessage(id, channelID, message)
+	})
+
+	if err != nil {
+		log.Printf("Error scheduling job %d: %v", id, err)
+		return
+	}
+
+	cronJobs[id] = entryID
+	debugLog(fmt.Sprintf("Scheduled job %d with spec: %s", id, cronSpec))
+}
+
+func sendScheduledMessage(scheduleID int, channelID, message string) {
+	// Check if schedule is still active
+	var active bool
+	err := db.QueryRow("SELECT active FROM schedules WHERE id = ?", scheduleID).Scan(&active)
+	if err != nil || !active {
+		debugLog(fmt.Sprintf("Schedule %d is inactive, skipping message", scheduleID))
+		return
+	}
+
+	_, err = botSession.ChannelMessageSend(channelID, message)
+	if err != nil {
+		log.Printf("Error sending scheduled message for schedule %d: %v", scheduleID, err)
+	} else {
+		debugLog(fmt.Sprintf("Sent scheduled message for schedule %d to channel %s", scheduleID, channelID))
 	}
 }
 
-func calculateNextRun(lastRun time.Time, repeatType, repeatValue string) time.Time {
-	if repeatType == "interval" {
-		minutes, _ := strconv.Atoi(repeatValue)
-		return lastRun.Add(time.Duration(minutes) * time.Minute)
-	} else if repeatType == "days" {
-		days := strings.Split(repeatValue, ",")
-		dayMap := map[string]time.Weekday{
-			"Sun": time.Sunday, "Mon": time.Monday, "Tue": time.Tuesday,
-			"Wed": time.Wednesday, "Thu": time.Thursday, "Fri": time.Friday, "Sat": time.Saturday,
-		}
-
-		next := lastRun.Add(24 * time.Hour)
-		for i := 0; i < 7; i++ {
-			for _, day := range days {
-				if dayMap[strings.TrimSpace(day)] == next.Weekday() {
-					return next
-				}
-			}
-			next = next.Add(24 * time.Hour)
-		}
+func removeScheduleJob(scheduleID int) {
+	if entryID, exists := cronJobs[scheduleID]; exists {
+		cronManager.Remove(entryID)
+		delete(cronJobs, scheduleID)
+		debugLog(fmt.Sprintf("Removed cron job for schedule %d", scheduleID))
 	}
-	return lastRun.Add(24 * time.Hour)
 }
