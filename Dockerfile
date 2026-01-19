@@ -23,13 +23,13 @@ FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates sqlite-libs
 
-WORKDIR /root/
+WORKDIR /app
 
 # Copy the binary from builder
 COPY --from=builder /app/bot .
 
-# Create directory for database
-RUN mkdir -p /root/data
+# Copy .env file if it exists (optional, can use env vars instead)
+COPY .env* ./ 2>/dev/null || true
 
 # Run the bot
 CMD ["./bot"]

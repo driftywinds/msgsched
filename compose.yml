@@ -11,7 +11,7 @@ services:
     #  - ADMIN_IDS=${ADMIN_IDS}
     #  - DEBUG=${DEBUG:-false}
     volumes:
-      - ./data:/root/data
-      - ./schedules.db:/root/schedules.db
+      - ./:/app
+    working_dir: /app
     env_file:
       - .env
