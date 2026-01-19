@@ -1,8 +1,8 @@
-# Build stage
+# Build stage - Use a different approach for Alpine
 FROM golang:1.21-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache gcc musl-dev
+# Install build dependencies including sqlite-dev
+RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 WORKDIR /app
 
@@ -13,13 +13,13 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=1 GOOS=linux go build -o discord-bot main.go
+# Build with specific CGO flags for Alpine
+RUN CGO_ENABLED=1 GOOS=linux go build -tags musl -o discord-bot main.go
 
 # Final stage
 FROM alpine:latest
 
-# Install runtime dependencies (sqlite3 needs libc)
+# Install runtime dependencies (sqlite-libs instead of sqlite-dev)
 RUN apk add --no-cache ca-certificates sqlite-libs tzdata
 
 # Create non-root user
