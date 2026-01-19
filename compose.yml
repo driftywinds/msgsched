@@ -1,17 +1,16 @@
-version: '3.8'
+version: "3.9"
 
 services:
   msgsched:
-    #build: .
     image: ghcr.io/driftywinds/msgsched
     container_name: msgsched
     restart: unless-stopped
-    #environment:
-    #  - DISCORD_TOKEN=${DISCORD_TOKEN}
-    #  - ADMIN_IDS=${ADMIN_IDS}
-    #  - DEBUG=${DEBUG:-false}
-    volumes:
-      - ./:/app
-    working_dir: /app
+
     env_file:
       - .env
+
+    volumes:
+      - ./schedules.db:/app/schedules.db
+
+    environment:
+      TZ: Asia/Kolkata

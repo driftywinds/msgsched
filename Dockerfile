@@ -1,40 +1,39 @@
-# Build stage
-FROM golang:1.21-bookworm AS builder
+# ---------- Build stage ----------
+FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
 
-# Copy go mod files first for better caching
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download && go mod verify
-
-# Copy all source files
-COPY . .
-
-# Build the application with static linking where possible
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o bot .
-
-# Runtime stage
-FROM debian:bookworm-slim
-
-# Install runtime dependencies
+# Required for go-sqlite3 (CGO)
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    sqlite3 \
+    gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# CGO must be enabled for sqlite
+ENV CGO_ENABLED=1
+ENV GOOS=linux
+
+RUN go build -o discord-bot main.go
+
+# ---------- Runtime stage ----------
+FROM debian:bookworm-slim
+
 WORKDIR /app
 
-# Copy the binary from builder
-COPY --from=builder /app/bot .
+# sqlite runtime deps
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for security
-RUN useradd -m -u 1000 botuser && \
-    chown -R botuser:botuser /app
+COPY --from=builder /app/discord-bot /app/discord-bot
 
-# Switch to non-root user
-USER botuser
+# Where DB + env will live
+VOLUME ["/app"]
 
-# Run the bot
-CMD ["./bot"]
+CMD ["./discord-bot"]
