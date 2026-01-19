@@ -1,8 +1,5 @@
-# Build stage - Use a different approach for Alpine
-FROM golang:1.21-alpine AS builder
-
-# Install build dependencies including sqlite-dev
-RUN apk add --no-cache gcc musl-dev sqlite-dev
+# Build stage - Use Debian for better C compatibility
+FROM golang:1.21-bookworm AS builder
 
 WORKDIR /app
 
@@ -13,17 +10,20 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build with specific CGO flags for Alpine
-RUN CGO_ENABLED=1 GOOS=linux go build -tags musl -o discord-bot main.go
+# Build the application (CGO enabled for SQLite)
+RUN CGO_ENABLED=1 GOOS=linux go build -o discord-bot main.go
 
-# Final stage
-FROM alpine:latest
+# Final stage - Use Debian slim for compatibility
+FROM debian:12-slim
 
-# Install runtime dependencies (sqlite-libs instead of sqlite-dev)
-RUN apk add --no-cache ca-certificates sqlite-libs tzdata
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN adduser -D -u 1000 discordbot
+RUN adduser --disabled-password --gecos "" --uid 1000 discordbot
 
 WORKDIR /app
 
