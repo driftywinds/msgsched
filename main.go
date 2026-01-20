@@ -46,9 +46,10 @@ func main() {
 		log.Println("Info: No .env file found, using environment variables")
 	}
 
-	// Get container timezone
-	containerTZ = getContainerTimezone()
-	log.Printf("Container timezone: %v", containerTZ)
+	// Get bot timezone
+	containerTZ = getBotTimezone()
+	log.Printf("Bot timezone: %v (offset from UTC: %s)", 
+		containerTZ, time.Now().In(containerTZ).Format("-07:00"))
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
@@ -101,18 +102,19 @@ func main() {
 	dg.Close()
 }
 
-func getContainerTimezone() *time.Location {
-	// Try to get from environment variable
-	tzEnv := os.Getenv("TZ")
-	if tzEnv == "" {
-		tzEnv = "UTC"
-	}
-
-	loc, err := time.LoadLocation(tzEnv)
+func getBotTimezone() *time.Location {
+	// Always use Asia/Kolkata for your setup
+	loc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {
-		log.Printf("Warning: Failed to load timezone %s, using UTC: %v", tzEnv, err)
-		return time.UTC
+		// Fall back to system local timezone
+		log.Printf("Warning: Failed to load Asia/Kolkata: %v, using system local timezone", err)
+		return time.Local
 	}
+	
+	// Log the actual timezone being used
+	now := time.Now().In(loc)
+	log.Printf("Bot configured for timezone: %v (current time: %s)", loc, now.Format("2006-01-02 15:04:05 MST"))
+	
 	return loc
 }
 
@@ -159,7 +161,7 @@ func initDB() {
 func ready(s *discordgo.Session, event *discordgo.Ready) {
 	s.UpdateGameStatus(0, "Scheduling messages")
 	debugLog(fmt.Sprintf("Logged in as: %v#%v", s.State.User.Username, s.State.User.Discriminator))
-	debugLog(fmt.Sprintf("Container timezone: %v", containerTZ))
+	debugLog(fmt.Sprintf("Bot timezone: %v", containerTZ))
 }
 
 func registerCommands(s *discordgo.Session) {
@@ -186,7 +188,7 @@ func registerCommands(s *discordgo.Session) {
 		},
 		{
 			Name:        "list_schedules",
-			Description: "List your schedules",
+			Description: "List your schedules with details",
 		},
 		{
 			Name:        "edit_schedule",
@@ -250,7 +252,7 @@ func registerCommands(s *discordgo.Session) {
 		},
 		{
 			Name:        "admin_list_all",
-			Description: "[Admin] List all schedules",
+			Description: "[Admin] List all schedules with full details",
 		},
 		{
 			Name:        "admin_pause",
@@ -404,7 +406,7 @@ func handleHelp(s *discordgo.Session, i *discordgo.InteractionCreate) {
 **User Commands:**
 /set_timezone - Set your timezone (e.g., Asia/Kolkata)
 /create_schedule - Create a new message schedule
-/list_schedules - List your schedules
+/list_schedules - List your schedules with timezone details
 /edit_schedule - Edit an existing schedule
 /pause_schedule - Pause a schedule
 /resume_schedule - Resume a paused schedule
@@ -412,9 +414,9 @@ func handleHelp(s *discordgo.Session, i *discordgo.InteractionCreate) {
 /test_schedule - Test a schedule by sending immediately
 
 **Admin Commands:**
-/admin_list_all - List all schedules from all users
-/admin_pause - Pause any user's schedule
-/admin_delete - Delete any user's schedule
+/admin_list_all - [Admin] List all schedules with full timezone conversion details
+/admin_pause - [Admin] Pause any user's schedule
+/admin_delete - [Admin] Delete any user's schedule
 
 **Repeat Types:**
 **none** - Send once (leave repeat_value empty or specify time: 2024-12-25 10:00)
@@ -526,8 +528,24 @@ func handleCreateSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) 
 	}
 }
 
+func formatScheduleForUserList(repeatType, repeatValue, timezone string) string {
+	switch repeatType {
+	case "weekly":
+		return fmt.Sprintf("%s (Timezone: %s)", repeatValue, timezone)
+	case "none":
+		if repeatValue == "" {
+			return "Immediately (Timezone: " + timezone + ")"
+		}
+		return fmt.Sprintf("%s (Timezone: %s)", repeatValue, timezone)
+	case "interval":
+		return fmt.Sprintf("Every %s", repeatValue)
+	default:
+		return repeatValue
+	}
+}
+
 func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	rows, err := db.Query("SELECT id, title, channel_id, repeat_type, active FROM schedules WHERE user_id = ?", i.Member.User.ID)
+	rows, err := db.Query("SELECT id, title, channel_id, repeat_type, repeat_value, timezone, active FROM schedules WHERE user_id = ?", i.Member.User.ID)
 	if err != nil {
 		respondEphemeral(s, i, "Error fetching schedules")
 		return
@@ -537,16 +555,19 @@ func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var schedules []string
 	for rows.Next() {
 		var id int
-		var title, channelID, repeatType string
+		var title, channelID, repeatType, repeatValue, timezone string
 		var active bool
-		rows.Scan(&id, &title, &channelID, &repeatType, &active)
+		rows.Scan(&id, &title, &channelID, &repeatType, &repeatValue, &timezone, &active)
 
 		status := "✅ Active"
 		if !active {
 			status = "⏸️ Paused"
 		}
 
-		schedules = append(schedules, fmt.Sprintf("**ID %d**: %s | %s | Type: %s | Channel: <#%s>", id, title, status, repeatType, channelID))
+		scheduleTime := formatScheduleForUserList(repeatType, repeatValue, timezone)
+
+		schedules = append(schedules, fmt.Sprintf("**ID %d**: %s | %s\n• Type: %s\n• Time: %s\n• Channel: <#%s>", 
+			id, title, status, repeatType, scheduleTime, channelID))
 	}
 
 	if len(schedules) == 0 {
@@ -554,7 +575,154 @@ func handleListSchedules(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	respondEphemeral(s, i, "**Your Schedules:**\n"+strings.Join(schedules, "\n"))
+	respondEphemeral(s, i, "**Your Schedules:**\n\n"+strings.Join(schedules, "\n\n"))
+}
+
+func formatScheduleForAdminList(repeatType, repeatValue, userTimezone string) string {
+	userLoc, err := time.LoadLocation(userTimezone)
+	if err != nil {
+		userLoc = time.UTC
+		userTimezone = "UTC"
+	}
+
+	switch repeatType {
+	case "weekly":
+		parts := strings.Split(repeatValue, " ")
+		if len(parts) != 2 {
+			return fmt.Sprintf("Invalid format: %s (Timezone: %s)", repeatValue, userTimezone)
+		}
+
+		daysStr := parts[0]
+		timeStr := parts[1]
+		
+		// Parse time
+		timeParts := strings.Split(timeStr, ":")
+		if len(timeParts) != 2 {
+			return fmt.Sprintf("Invalid time: %s (Timezone: %s)", repeatValue, userTimezone)
+		}
+		
+		userHour, _ := strconv.Atoi(timeParts[0])
+		userMinute, _ := strconv.Atoi(timeParts[1])
+		
+		// Parse days
+		days := strings.Split(daysStr, ",")
+		dayMap := map[string]string{
+			"sun": "Sun", "mon": "Mon", "tue": "Tue", "wed": "Wed",
+			"thu": "Thu", "fri": "Fri", "sat": "Sat",
+		}
+		
+		var convertedDays []string
+		for _, day := range days {
+			dayLower := strings.ToLower(strings.TrimSpace(day))
+			if dayName, ok := dayMap[dayLower]; ok {
+				// Calculate next occurrence for this day
+				containerTime := calculateContainerTime(dayName, userHour, userMinute, userLoc)
+				convertedDays = append(convertedDays, 
+					fmt.Sprintf("%s %02d:%02d %s", dayName, containerTime.Hour(), containerTime.Minute(), containerTZ))
+			}
+		}
+		
+		if len(convertedDays) == 0 {
+			return fmt.Sprintf("%s (User: %s %02d:%02d) -> Error converting days", 
+				repeatValue, userTimezone, userHour, userMinute)
+		}
+		
+		return fmt.Sprintf("%s (User: %s %02d:%02d) -> Bot: %s", 
+			repeatValue, userTimezone, userHour, userMinute, strings.Join(convertedDays, ", "))
+			
+	case "none":
+		if repeatValue == "" {
+			return fmt.Sprintf("Immediately (Timezone: %s)", userTimezone)
+		}
+		
+		// Parse specific time
+		userTime, err := time.ParseInLocation("2006-01-02 15:04", repeatValue, userLoc)
+		if err != nil {
+			return fmt.Sprintf("%s (Timezone: %s) -> Invalid format", repeatValue, userTimezone)
+		}
+		
+		containerTime := userTime.In(containerTZ)
+		return fmt.Sprintf("%s (User: %s) -> %s (Bot: %s)", 
+			userTime.Format("2006-01-02 15:04"), userTimezone,
+			containerTime.Format("2006-01-02 15:04"), containerTZ)
+			
+	case "interval":
+		return fmt.Sprintf("Every %s (Timezone independent)", repeatValue)
+		
+	default:
+		return fmt.Sprintf("%s (Timezone: %s)", repeatValue, userTimezone)
+	}
+}
+
+func calculateContainerTime(dayName string, userHour, userMinute int, userLoc *time.Location) time.Time {
+	// Map day names to time.Weekday
+	dayMap := map[string]time.Weekday{
+		"sun": time.Sunday, "mon": time.Monday, "tue": time.Tuesday, 
+		"wed": time.Wednesday, "thu": time.Thursday, "fri": time.Friday, 
+		"sat": time.Saturday,
+	}
+	
+	userDay := dayMap[strings.ToLower(dayName)]
+	
+	// Find the next occurrence of this day at the specified time in user's timezone
+	now := time.Now().In(userLoc)
+	daysUntilNext := (int(userDay) - int(now.Weekday()) + 7) % 7
+	if daysUntilNext == 0 {
+		userTimeToday := time.Date(now.Year(), now.Month(), now.Day(), userHour, userMinute, 0, 0, userLoc)
+		if userTimeToday.Before(now) {
+			daysUntilNext = 7
+		}
+	}
+	
+	targetDate := now.AddDate(0, 0, daysUntilNext)
+	userTime := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), userHour, userMinute, 0, 0, userLoc)
+	
+	// Convert to container timezone
+	return userTime.In(containerTZ)
+}
+
+func handleAdminListAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !isAdmin(i.Member.User.ID) {
+		respondEphemeral(s, i, "❌ You don't have permission to use this command")
+		return
+	}
+
+	rows, err := db.Query("SELECT id, user_id, title, channel_id, repeat_type, repeat_value, timezone, active FROM schedules")
+	if err != nil {
+		respondEphemeral(s, i, "Error fetching schedules")
+		return
+	}
+	defer rows.Close()
+
+	var schedules []string
+	for rows.Next() {
+		var id int
+		var userID, title, channelID, repeatType, repeatValue, timezone string
+		var active bool
+		rows.Scan(&id, &userID, &title, &channelID, &repeatType, &repeatValue, &timezone, &active)
+
+		status := "✅ Active"
+		if !active {
+			status = "⏸️ Paused"
+		}
+
+		// Get user's display name if possible
+		userDisplay := fmt.Sprintf("<@%s>", userID)
+		
+		// Format schedule time with conversion details
+		scheduleDetails := formatScheduleForAdminList(repeatType, repeatValue, timezone)
+
+		schedules = append(schedules, fmt.Sprintf("**ID %d**: %s | %s\n• User: %s\n• Type: %s\n• %s\n• Channel: <#%s>\n• Bot Timezone: %v", 
+			id, title, status, userDisplay, repeatType, scheduleDetails, channelID, containerTZ))
+	}
+
+	if len(schedules) == 0 {
+		respondEphemeral(s, i, "No schedules found")
+		return
+	}
+
+	debugLog(fmt.Sprintf("Admin %s listed all schedules", i.Member.User.ID))
+	respondEphemeral(s, i, "**All Schedules:**\n\n"+strings.Join(schedules, "\n\n"))
 }
 
 func handlePauseSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -725,43 +893,6 @@ func handleEditSchedule(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if err != nil {
 		log.Println("Error showing edit modal:", err)
 	}
-}
-
-func handleAdminListAll(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if !isAdmin(i.Member.User.ID) {
-		respondEphemeral(s, i, "❌ You don't have permission to use this command")
-		return
-	}
-
-	rows, err := db.Query("SELECT id, user_id, title, channel_id, repeat_type, active FROM schedules")
-	if err != nil {
-		respondEphemeral(s, i, "Error fetching schedules")
-		return
-	}
-	defer rows.Close()
-
-	var schedules []string
-	for rows.Next() {
-		var id int
-		var userID, title, channelID, repeatType string
-		var active bool
-		rows.Scan(&id, &userID, &title, &channelID, &repeatType, &active)
-
-		status := "✅"
-		if !active {
-			status = "⏸️"
-		}
-
-		schedules = append(schedules, fmt.Sprintf("%s **ID %d**: %s | User: <@%s> | Type: %s", status, id, title, userID, repeatType))
-	}
-
-	if len(schedules) == 0 {
-		respondEphemeral(s, i, "No schedules found")
-		return
-	}
-
-	debugLog(fmt.Sprintf("Admin %s listed all schedules", i.Member.User.ID))
-	respondEphemeral(s, i, "**All Schedules:**\n"+strings.Join(schedules, "\n"))
 }
 
 func handleAdminPause(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -1059,8 +1190,9 @@ func sendScheduledMessage(scheduleID int, channelID, message string) {
 		return
 	}
 
-	debugLog(fmt.Sprintf("Attempting to send schedule %d ('%s') to channel %s", scheduleID, title, channelID))
-	debugLog(fmt.Sprintf("Message content (first 100 chars): %.100s", message))
+	log.Printf("CRON TRIGGERED: Schedule %d ('%s') at %v", 
+		scheduleID, title, time.Now().Format("2006-01-02 15:04:05 MST"))
+	log.Printf("SENDING to channel %s: %s", channelID, message)
 
 	// Try to send message
 	msg, err := botSession.ChannelMessageSend(channelID, message)
@@ -1075,8 +1207,8 @@ func sendScheduledMessage(scheduleID int, channelID, message string) {
 			log.Printf("Channel info: Name=%s, Guild=%s, Type=%d", channel.Name, channel.GuildID, channel.Type)
 		}
 	} else {
-		debugLog(fmt.Sprintf("SUCCESS: Sent scheduled message for schedule %d to channel %s (Message ID: %s)", 
-			scheduleID, channelID, msg.ID))
+		log.Printf("SUCCESS: Sent scheduled message for schedule %d to channel %s (Message ID: %s, Time: %v)", 
+			scheduleID, channelID, msg.ID, msg.Timestamp.Format("2006-01-02 15:04:05 MST"))
 	}
 }
 
