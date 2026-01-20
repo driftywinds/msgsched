@@ -24,6 +24,7 @@ var (
 	debug       bool
 	botSession  *discordgo.Session
 	cronJobs    = make(map[int]cron.EntryID)
+	containerTZ *time.Location
 )
 
 type Schedule struct {
@@ -39,19 +40,24 @@ type Schedule struct {
 }
 
 func main() {
+	// Try to load .env file, but don't fail if it doesn't exist
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("Error loading .env file")
+		log.Println("Info: No .env file found, using environment variables")
 	}
+
+	// Get container timezone
+	containerTZ = getContainerTimezone()
+	log.Printf("Container timezone: %v", containerTZ)
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
-		log.Fatal("DISCORD_TOKEN not set in .env")
+		log.Fatal("DISCORD_TOKEN not set")
 	}
 
 	adminIDs := os.Getenv("ADMIN_IDS")
 	if adminIDs == "" {
-		log.Fatal("ADMIN_IDS not set in .env")
+		log.Fatal("ADMIN_IDS not set")
 	}
 	admins = strings.Split(adminIDs, ",")
 	for i := range admins {
@@ -63,7 +69,7 @@ func main() {
 	initDB()
 	defer db.Close()
 
-	cronManager = cron.New()
+	cronManager = cron.New(cron.WithLocation(containerTZ))
 	cronManager.Start()
 	defer cronManager.Stop()
 
@@ -77,7 +83,7 @@ func main() {
 	dg.AddHandler(ready)
 	dg.AddHandler(interactionCreate)
 
-	dg.Identify.Intents = discordgo.IntentsGuilds
+	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 
 	err = dg.Open()
 	if err != nil {
@@ -95,9 +101,31 @@ func main() {
 	dg.Close()
 }
 
+func getContainerTimezone() *time.Location {
+	// Try to get from environment variable
+	tzEnv := os.Getenv("TZ")
+	if tzEnv == "" {
+		tzEnv = "UTC"
+	}
+
+	loc, err := time.LoadLocation(tzEnv)
+	if err != nil {
+		log.Printf("Warning: Failed to load timezone %s, using UTC: %v", tzEnv, err)
+		return time.UTC
+	}
+	return loc
+}
+
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "./schedules.db")
+	
+	// Use persistent path in Docker, fallback to local
+	dbPath := "./schedules.db"
+	if _, err := os.Stat("/data"); err == nil {
+		dbPath = "/data/schedules.db"
+	}
+	
+	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -125,12 +153,13 @@ func initDB() {
 		log.Fatal(err)
 	}
 
-	debugLog("Database initialized")
+	debugLog("Database initialized at: " + dbPath)
 }
 
 func ready(s *discordgo.Session, event *discordgo.Ready) {
 	s.UpdateGameStatus(0, "Scheduling messages")
 	debugLog(fmt.Sprintf("Logged in as: %v#%v", s.State.User.Username, s.State.User.Discriminator))
+	debugLog(fmt.Sprintf("Container timezone: %v", containerTZ))
 }
 
 func registerCommands(s *discordgo.Session) {
@@ -831,9 +860,11 @@ func loadSchedules() {
 }
 
 func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone string) {
-	loc, err := time.LoadLocation(timezone)
+	// Get user's timezone
+	userLoc, err := time.LoadLocation(timezone)
 	if err != nil {
-		loc = time.UTC
+		debugLog(fmt.Sprintf("Schedule %d: Invalid timezone %s, using UTC", id, timezone))
+		userLoc = time.UTC
 	}
 
 	var cronSpec string
@@ -847,8 +878,9 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 			return
 		}
 
-		// Use cron's @every syntax
+		// Use cron's @every syntax (always in container timezone)
 		cronSpec = fmt.Sprintf("@every %s", duration.String())
+		debugLog(fmt.Sprintf("Schedule %d: Interval %s -> cron: %s", id, repeatValue, cronSpec))
 
 	case "weekly":
 		// Parse weekly schedule like "Mon,Wed,Fri 09:00"
@@ -858,7 +890,7 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 			return
 		}
 
-		days := strings.Split(parts[0], ",")
+		daysStr := parts[0]
 		timeStr := parts[1]
 
 		timeParts := strings.Split(timeStr, ":")
@@ -867,52 +899,127 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 			return
 		}
 
-		hour := timeParts[0]
-		minute := timeParts[1]
+		userHour, err := strconv.Atoi(timeParts[0])
+		if err != nil {
+			log.Printf("Invalid hour for schedule %d: %s", id, timeParts[0])
+			return
+		}
 
-		// Convert day names to cron day numbers
-		dayNumbers := []string{}
+		userMinute, err := strconv.Atoi(timeParts[1])
+		if err != nil {
+			log.Printf("Invalid minute for schedule %d: %s", id, timeParts[1])
+			return
+		}
+
+		// Parse days
+		days := strings.Split(daysStr, ",")
 		dayMap := map[string]string{
 			"sun": "0", "mon": "1", "tue": "2", "wed": "3",
 			"thu": "4", "fri": "5", "sat": "6",
 		}
 
+		// Create a time in user's timezone to convert to container timezone
+		// We'll use the next occurrence of each day for calculation
+		now := time.Now().In(userLoc)
+		containerDays := make(map[int]bool) // Track unique container days
+
+		// For each day specified, find the next occurrence and convert to container timezone
 		for _, day := range days {
 			dayLower := strings.ToLower(strings.TrimSpace(day))
-			if num, ok := dayMap[dayLower]; ok {
-				dayNumbers = append(dayNumbers, num)
+			if userDayNumStr, ok := dayMap[dayLower]; ok {
+				userDayNum, _ := strconv.Atoi(userDayNumStr)
+
+				// Calculate the next occurrence of this day at the specified time in user's timezone
+				daysUntilNext := (userDayNum - int(now.Weekday()) + 7) % 7
+				if daysUntilNext == 0 {
+					// If it's today, check if the time has passed
+					userTimeToday := time.Date(now.Year(), now.Month(), now.Day(), userHour, userMinute, 0, 0, userLoc)
+					if userTimeToday.Before(now) {
+						daysUntilNext = 7 // Move to next week
+					}
+				}
+
+				targetDate := now.AddDate(0, 0, daysUntilNext)
+				userTime := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), userHour, userMinute, 0, 0, userLoc)
+
+				// Convert to container timezone
+				containerTime := userTime.In(containerTZ)
+
+				// Store the container day and time
+				containerDays[int(containerTime.Weekday())] = true
+
+				debugLog(fmt.Sprintf("Schedule %d: User %s %s %02d:%02d -> Container %s %02d:%02d",
+					id, day, timezone, userHour, userMinute,
+					containerTime.Weekday().String(), containerTime.Hour(), containerTime.Minute()))
 			}
 		}
 
-		if len(dayNumbers) == 0 {
+		if len(containerDays) == 0 {
 			log.Printf("No valid days for schedule %d", id)
 			return
 		}
 
-		// Cron format: minute hour * * day
-		cronSpec = fmt.Sprintf("%s %s * * %s", minute, hour, strings.Join(dayNumbers, ","))
+		// For simplicity, we'll use the time from the first day's conversion
+		// In practice, all should have the same hour/minute conversion
+		// Pick a reference day to get the time
+		firstUserDay := strings.ToLower(strings.TrimSpace(days[0]))
+		if userDayNumStr, ok := dayMap[firstUserDay]; ok {
+			userDayNum, _ := strconv.Atoi(userDayNumStr)
+			daysUntilNext := (userDayNum - int(now.Weekday()) + 7) % 7
+			if daysUntilNext == 0 {
+				userTimeToday := time.Date(now.Year(), now.Month(), now.Day(), userHour, userMinute, 0, 0, userLoc)
+				if userTimeToday.Before(now) {
+					daysUntilNext = 7
+				}
+			}
+
+			targetDate := now.AddDate(0, 0, daysUntilNext)
+			userTime := time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), userHour, userMinute, 0, 0, userLoc)
+			containerTime := userTime.In(containerTZ)
+
+			// Build list of container day numbers
+			var containerDayNumbers []string
+			for dayNum := range containerDays {
+				containerDayNumbers = append(containerDayNumbers, strconv.Itoa(dayNum))
+			}
+
+			// Cron format: minute hour * * day (in container timezone)
+			cronSpec = fmt.Sprintf("%d %d * * %s",
+				containerTime.Minute(),
+				containerTime.Hour(),
+				strings.Join(containerDayNumbers, ","))
+
+			debugLog(fmt.Sprintf("Schedule %d: Final cron spec: %s (Container TZ: %v)",
+				id, cronSpec, containerTZ))
+		}
 
 	case "none":
-		// One-time schedule - execute once and then disable
+		// One-time schedule
 		if repeatValue == "" {
 			// Execute immediately
 			go sendScheduledMessage(id, channelID, message)
 			return
 		}
 
-		// Parse specific time
-		t, err := time.ParseInLocation("2006-01-02 15:04", repeatValue, loc)
+		// Parse specific time in user's timezone
+		userTime, err := time.ParseInLocation("2006-01-02 15:04", repeatValue, userLoc)
 		if err != nil {
 			log.Printf("Invalid time format for schedule %d: %s", id, repeatValue)
 			return
 		}
 
-		// Schedule for specific time
-		duration := time.Until(t)
+		// Convert to container timezone
+		containerTime := userTime.In(containerTZ)
+		duration := time.Until(containerTime)
+
 		if duration < 0 {
 			log.Printf("Schedule %d time is in the past: %s", id, repeatValue)
 			return
 		}
+
+		debugLog(fmt.Sprintf("Schedule %d: One-time at %s (%s) -> %s (%s), duration: %v",
+			id, userTime.Format("2006-01-02 15:04"), timezone,
+			containerTime.Format("2006-01-02 15:04"), containerTZ, duration))
 
 		time.AfterFunc(duration, func() {
 			sendScheduledMessage(id, channelID, message)
@@ -921,7 +1028,6 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 			debugLog(fmt.Sprintf("One-time schedule %d completed and disabled", id))
 		})
 
-		debugLog(fmt.Sprintf("Scheduled one-time message for schedule %d at %s", id, t.Format("2006-01-02 15:04")))
 		return
 
 	default:
@@ -929,7 +1035,7 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 		return
 	}
 
-	// Add cron job
+	// Add cron job with container timezone
 	entryID, err := cronManager.AddFunc(cronSpec, func() {
 		sendScheduledMessage(id, channelID, message)
 	})
@@ -946,17 +1052,31 @@ func scheduleJob(id int, channelID, message, repeatType, repeatValue, timezone s
 func sendScheduledMessage(scheduleID int, channelID, message string) {
 	// Check if schedule is still active
 	var active bool
-	err := db.QueryRow("SELECT active FROM schedules WHERE id = ?", scheduleID).Scan(&active)
+	var title, userTimezone string
+	err := db.QueryRow("SELECT active, title, timezone FROM schedules WHERE id = ?", scheduleID).Scan(&active, &title, &userTimezone)
 	if err != nil || !active {
-		debugLog(fmt.Sprintf("Schedule %d is inactive, skipping message", scheduleID))
+		debugLog(fmt.Sprintf("Schedule %d is inactive or not found, skipping message", scheduleID))
 		return
 	}
 
-	_, err = botSession.ChannelMessageSend(channelID, message)
+	debugLog(fmt.Sprintf("Attempting to send schedule %d ('%s') to channel %s", scheduleID, title, channelID))
+	debugLog(fmt.Sprintf("Message content (first 100 chars): %.100s", message))
+
+	// Try to send message
+	msg, err := botSession.ChannelMessageSend(channelID, message)
 	if err != nil {
-		log.Printf("Error sending scheduled message for schedule %d: %v", scheduleID, err)
+		log.Printf("ERROR sending scheduled message for schedule %d: %v", scheduleID, err)
+		
+		// Try to get channel info for debugging
+		channel, channelErr := botSession.Channel(channelID)
+		if channelErr != nil {
+			log.Printf("ERROR: Could not fetch channel %s: %v", channelID, channelErr)
+		} else {
+			log.Printf("Channel info: Name=%s, Guild=%s, Type=%d", channel.Name, channel.GuildID, channel.Type)
+		}
 	} else {
-		debugLog(fmt.Sprintf("Sent scheduled message for schedule %d to channel %s", scheduleID, channelID))
+		debugLog(fmt.Sprintf("SUCCESS: Sent scheduled message for schedule %d to channel %s (Message ID: %s)", 
+			scheduleID, channelID, msg.ID))
 	}
 }
 
